@@ -7,7 +7,7 @@ Script to add Bee node's /metrics endpoint to data gathered by Netdata.
 - Machine should probably be a Linux box (tested on Ubuntu)
 
 ## Instructions
-- Save the script: Save the above content to a file, for example, `add_bee_metrics_to_netdata.sh`.
+- Save the script: Save the above content to a file, for example, `add_bee_metrics_to_netdata.sh`
 - Make it executable: `chmod +x add_bee_metrics_to_netdata.sh`
 - Run the script: `sudo ./add_bee_metrics_to_netdata.sh`
 

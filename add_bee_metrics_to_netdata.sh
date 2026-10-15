@@ -1,82 +1,103 @@
 #!/bin/bash
+# Add a bee node's /metrics endpoint to Netdata's Prometheus collector (go.d "prometheus" module).
+#
+#   sudo ./add_bee_metrics_to_netdata.sh [--dry-run] [--url URL] [--name NAME]
+#
+# Defaults: URL http://localhost:1633/metrics, job name bee_node. Run once per bee API port
+# (give each a different --name). Safe to re-run: an existing job with the same name is left as it is.
+#
+# What it writes: one job in <netdata config>/go.d/prometheus.conf. The file is backed up first and
+# replaced atomically. The job raises Netdata's series limits (bee publishes about 1,600 series; with
+# the default limit of 2,000 a node that grows past it would be dropped entirely) and skips
+# bee_localstore_leveldb_stats (about 450 series of database internals, above the per-metric limit).
+# After the restart the script waits until Netdata's local API shows the job's charts.
+set -euo pipefail
 
-# Define the Bee metrics endpoint
-BEE_METRICS_URL="http://localhost:1633/metrics"
-BEE_JOB_NAME="bee_node"
-NETDATA_UPDATE_EVERY=5 # seconds
+URL="http://localhost:1633/metrics"
+NAME="bee_node"
+DRY=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dry-run) DRY=1; shift ;;
+        --url) URL=$2; shift 2 ;;
+        --name) NAME=$2; shift 2 ;;
+        -h|--help) sed -n 2,13p "$0"; exit 0 ;;
+        *) echo "unknown option: $1" >&2; exit 2 ;;
+    esac
+done
 
-# --- Find Netdata config directory ---
-NETDATA_CONFIG_DIR=""
+# --- find Netdata's config directory ---
+CONF_DIR=""
+for d in /etc/netdata /opt/netdata/etc/netdata /usr/local/etc/netdata; do
+    [ -d "$d" ] && { CONF_DIR=$d; break; }
+done
+[ -n "$CONF_DIR" ] || { echo "Netdata config directory not found (is Netdata installed?)" >&2; exit 1; }
+FILE="$CONF_DIR/go.d/prometheus.conf"
+echo "Netdata config: $CONF_DIR; collector file: $FILE"
 
-# Attempt to find it using common locations
-if [ -d "/etc/netdata" ]; then
-    NETDATA_CONFIG_DIR="/etc/netdata"
-elif [ -d "/opt/netdata/etc/netdata" ]; then
-    NETDATA_CONFIG_DIR="/opt/netdata/etc/netdata"
-elif [ -d "/usr/local/etc/netdata" ]; then
-    NETDATA_CONFIG_DIR="/usr/local/etc/netdata"
-else
-    # Fallback if common directories are not found
-    echo "Warning: Could not automatically determine Netdata configuration directory."
-    echo "Please provide it manually. Common locations are /etc/netdata or /opt/netdata/etc/netdata."
-    read -p "Enter Netdata config directory (e.g., /etc/netdata): " MANUAL_CONFIG_DIR
-    if [ -d "$MANUAL_CONFIG_DIR" ]; then
-        NETDATA_CONFIG_DIR="$MANUAL_CONFIG_DIR"
-    else
-        echo "Error: The provided directory '$MANUAL_CONFIG_DIR' does not exist or is not a directory."
-        echo "Please ensure Netdata is installed and running, and provide the correct path."
-        exit 1
-    fi
+# --- is the endpoint reachable? ---
+if ! curl -fsS -m 10 "$URL" -o /dev/null; then
+    echo "Cannot read $URL: is bee running and is its API on this address?" >&2
+    exit 1
+fi
+SERIES=$(curl -fsS -m 10 "$URL" | grep -vc '^#' || true)
+echo "Endpoint OK: $SERIES time series"
+
+if [ -f "$FILE" ] && grep -qE "^[[:space:]]*-[[:space:]]*name:[[:space:]]*$NAME[[:space:]]*$" "$FILE"; then
+    echo "Job '$NAME' already exists in $FILE; nothing changed."
+    exit 0
 fi
 
-PROMETHEUS_CONFIG_FILE="$NETDATA_CONFIG_DIR/go.d/prometheus.conf"
+JOB="  - name: $NAME
+    url: $URL
+    update_every: 10
+    timeout: 10
+    max_time_series: 3000
+    max_time_series_per_metric: 250
+    selector:
+      deny:
+        - bee_localstore_leveldb_stats*"
 
-echo "Using Netdata configuration directory: $NETDATA_CONFIG_DIR"
-echo "Prometheus collector configuration file: $PROMETHEUS_CONFIG_FILE"
-
-# --- Check if the prometheus.conf file exists, create if not ---
-if [ ! -f "$PROMETHEUS_CONFIG_FILE" ]; then
-    echo "Creating new prometheus.conf file..."
-    sudo mkdir -p "$(dirname "$PROMETHEUS_CONFIG_FILE")"
-    sudo touch "$PROMETHEUS_CONFIG_FILE"
-    echo "jobs:" | sudo tee -a "$PROMETHEUS_CONFIG_FILE" > /dev/null
+# --- build the new file content (existing jobs kept; comments kept) ---
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
+if [ -f "$FILE" ] && grep -qE '^jobs:' "$FILE"; then
+    cat "$FILE" > "$TMP"
+    printf '%s\n' "$JOB" >> "$TMP"
+elif [ -f "$FILE" ]; then
+    # a file without an active 'jobs:' list (e.g. only comments): keep it, add the list at the end
+    cat "$FILE" > "$TMP"
+    printf '\njobs:\n%s\n' "$JOB" >> "$TMP"
 else
-    # Ensure 'jobs:' exists at the start of the file if it's empty or doesn't have it
-    if ! grep -q "^jobs:" "$PROMETHEUS_CONFIG_FILE"; then
-        echo "Adding 'jobs:' section to prometheus.conf..."
-        # Add 'jobs:' at the beginning of the file if it's not there
-        (echo "jobs:"; cat "$PROMETHEUS_CONFIG_FILE") | sudo tee "$PROMETHEUS_CONFIG_FILE" > /dev/null
-    fi
+    printf 'jobs:\n%s\n' "$JOB" > "$TMP"
 fi
 
-# --- Check if Bee job already exists ---
-if grep -q "name: $BEE_JOB_NAME" "$PROMETHEUS_CONFIG_FILE"; then
-    echo "Bee node metrics job '$BEE_JOB_NAME' already exists in $PROMETHEUS_CONFIG_FILE."
-    echo "No changes made to the configuration."
-else
-    echo "Adding Bee node metrics job to $PROMETHEUS_CONFIG_FILE..."
-    BEE_CONFIG_BLOCK="
-  - name: $BEE_JOB_NAME
-    url: $BEE_METRICS_URL
-    update_every: $NETDATA_UPDATE_EVERY"
-
-    # Using tee -a to append the block
-    echo "$BEE_CONFIG_BLOCK" | sudo tee -a "$PROMETHEUS_CONFIG_FILE" > /dev/null
-
-    if [ $? -eq 0 ]; then
-        echo "Successfully added Bee node metrics configuration."
-        echo "Restarting Netdata service to apply changes..."
-        sudo systemctl restart netdata
-
-        if [ $? -eq 0 ]; then
-            echo "Netdata service restarted successfully."
-            echo "You should now see Bee node metrics in your Netdata dashboard (http://<your_netdata_server_ip>:19999/ or https://app.netdata.cloud)."
-        else
-            echo "Failed to restart Netdata service. Please check Netdata logs for errors."
-        fi
-    else
-        echo "Failed to write to $PROMETHEUS_CONFIG_FILE. Check permissions."
-    fi
+if [ $DRY = 1 ]; then
+    echo "--- dry run: $FILE would become ---"
+    cat "$TMP"
+    exit 0
 fi
 
-echo "Script finished."
+# --- install: back up, write atomically, restart, check ---
+mkdir -p "$(dirname "$FILE")"
+if [ -f "$FILE" ]; then
+    cp -a "$FILE" "$FILE.bak-$(date +%Y%m%d%H%M%S)"
+    echo "Backup: $FILE.bak-*"
+fi
+install -m 644 "$TMP" "$FILE.new"
+chown --reference="$CONF_DIR" "$FILE.new" 2>/dev/null || true
+mv "$FILE.new" "$FILE"
+
+systemctl restart netdata
+echo "Netdata restarted; waiting for the job's charts ..."
+for i in $(seq 1 18); do
+    n=$(curl -fsS -m 5 http://127.0.0.1:19999/api/v1/charts 2>/dev/null \
+        | grep -o "\"prometheus_${NAME}\.[^\"]*\":" | sort -u | wc -l || true)
+    if [ "${n:-0}" -gt 0 ]; then
+        echo "OK: $n charts for job '$NAME' (prometheus_$NAME.*), visible in the local dashboard and Netdata Cloud."
+        exit 0
+    fi
+    sleep 5
+done
+echo "Warning: no charts for '$NAME' after 90 s; check 'journalctl -u netdata | grep $NAME'." >&2
+exit 1
